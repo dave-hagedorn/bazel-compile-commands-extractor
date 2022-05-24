@@ -127,7 +127,7 @@ Finally, you'll need to `bazel run :refresh_compile_commands`
 ### Filtering Entries in compile_commands.json
 #### Header Files
 
-Some tools such as ccls work better without headers in compile_commands.json, whereas others like clangd prefer this (see [here](https://github.com/clangd/clangd/issues/123))
+Some tools such as ccls or CodeChecker work better without headers in compile_commands.json, whereas others like clangd prefer this (see [here](https://github.com/clangd/clangd/issues/123))
 
 To control generation of entries for headers, you can use `exclude_headers`:
 

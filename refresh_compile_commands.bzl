@@ -38,7 +38,7 @@ refresh_compile_commands(
 
     # To omit entries for some or all headers
         # Defaults to None (always include all headers)
-        # Some tools such as ccls work better without header entries, whereas others such as clangd require these (see https://github.com/clangd/clangd/issues/123 for why)
+        # Some tools such as ccls or CodeChecker work better without header entries, whereas others such as clangd require these (see https://github.com/clangd/clangd/issues/123 for why)
         # You may want to include some or all headers depending on your use cases
     exclude_headers = "all"         - Excludes all headers from compile_commands.json - works bet with ccls
     exclude_headers = "external"    - Excludes all headers from external workspaces and other non-workspace headers (/usr/include, etc.)
@@ -46,7 +46,6 @@ refresh_compile_commands(
                                       This works well if you use clangd but want to speed up indexing
 ```
 """
-
 
 ########################################
 # Implementation
@@ -56,8 +55,6 @@ load("@bazel_tools//tools/cpp:toolchain_utils.bzl", "find_cpp_toolchain")
 def refresh_compile_commands(
         name,
         targets = None,
-        exclude_headers = None,
-        exclude_external_sources = False,
         **kwargs):  # For the other common attributes. Tags, compatible_with, etc. https://docs.bazel.build/versions/main/be/common-definitions.html#common-attributes.
     # Convert the various, acceptable target shorthands into the dictionary format
     if not targets:  # Default to all targets in main workspace
@@ -67,10 +64,16 @@ def refresh_compile_commands(
     elif type(targets) != "dict":  # Assume they've supplied a single string/label and wrap it
         targets = {targets: ""}
 
+    rule_args = ("exclude_external_sources", "exclude_generated_sources", "exclude_headers", "absolute_compiler_path")
+
+    rule_kwargs = {k: v for k, v in kwargs.items() if k in rule_args}
+    py_kwargs = {k: v for k, v in kwargs.items() if k not in rule_args}
+
     # Generate runnable python script from template
     script_name = name + ".py"
-    _expand_template(name = script_name, labels_to_flags = targets, exclude_headers = exclude_headers, exclude_external_sources = exclude_external_sources, **kwargs)
-    native.py_binary(name = name, srcs = [script_name], **kwargs)
+    _expand_template(name = script_name, labels_to_flags = targets, **kwargs)
+
+    native.py_binary(name = name, srcs = [script_name], **py_kwargs)
 
 def _expand_template_impl(ctx):
     """Inject targets of interest into refresh.template.py, and set it up to be run."""
@@ -85,6 +88,8 @@ def _expand_template_impl(ctx):
             "        {windows_default_include_paths}": "\n".join(["        %r," % path for path in find_cpp_toolchain(ctx).built_in_include_directories]),  # find_cpp_toolchain is from https://docs.bazel.build/versions/main/integrating-with-rules-cc.html
             "{exclude_headers}": '"' + str(ctx.attr.exclude_headers) + '"',
             "{exclude_external_sources}": str(ctx.attr.exclude_external_sources),
+            "{exclude_generated_sources}": str(ctx.attr.exclude_generated_sources),
+            "{absolute_compiler_path}": str(ctx.attr.absolute_compiler_path),
         },
     )
     return DefaultInfo(files = depset([script]))
@@ -93,7 +98,9 @@ _expand_template = rule(
     attrs = {
         "labels_to_flags": attr.string_dict(mandatory = True),  # string keys instead of label_keyed because Bazel doesn't support parsing wildcard target patterns (..., *, :all) in BUILD attributes.
         "exclude_external_sources": attr.bool(default = False),
+        "exclude_generated_sources": attr.bool(default = False),
         "exclude_headers": attr.string(values = ["all", "external"]),
+        "absolute_compiler_path": attr.bool(default = False),
         "_script_template": attr.label(allow_single_file = True, default = "refresh.template.py"),
         "_cc_toolchain": attr.label(default = "@bazel_tools//tools/cpp:current_cc_toolchain"),  # For Windows INCLUDE. If this were eliminated, for example by the resolution of https://github.com/clangd/clangd/issues/123, we'd be able to just use a macro and skylib's expand_template rule: https://github.com/bazelbuild/bazel-skylib/pull/330
     },

@@ -228,6 +228,13 @@ def _file_in_workspace_and_not_extenral(file_str: str):
 
     return False
 
+def _file_is_generated(file_str: str):
+    file_rel_or_abs = pathlib.PurePath(file_str)
+    gen_abs = pathlib.PurePath(os.environ["BUILD_WORKSPACE_DIRECTORY"]).joinpath("bazel-out")
+    gen_rel = pathlib.PurePath("bazel-out")
+
+    return _is_relative_to(file_rel_or_abs, gen_abs) or _is_relative_to(file_rel_or_abs, gen_rel)
+
 
 def _get_headers(compile_action, compile_args: typing.List[str], source_path: str):
     """Gets the headers used by a particular compile command.
@@ -259,9 +266,7 @@ def _get_headers(compile_action, compile_args: typing.List[str], source_path: st
 
     return headers
 
-
-def _get_files(compile_action, compile_args: typing.List[str]):
-    """Gets the ({source files}, {header files}) clangd should be told the command applies to."""
+def _source_file_for_action(compile_action):
     # Bazel puts the source file being compiled after the -c flag, so we look for the source file there.
     # This is a strong assumption about Bazel internals, so we're taking special care to check that this condition holds with asserts. That way things don't fail silently if it changes some day.
         # -c just means compile-only; don't link into a binary. You can definitely have a proper invocation to clang/gcc where the source isn't right after -c, or where -c isn't present at all.
@@ -273,12 +278,25 @@ def _get_files(compile_action, compile_args: typing.List[str]):
                 # Concretely, the message usually has the form "action 'Compiling foo.cpp'"" -> foo.cpp. But it also has "action 'Compiling src/tools/launcher/dummy.cc [for tool]'" -> external/bazel_tools/src/tools/launcher/dummy.cc
                 # If we did ever go this route, you can join the output from aquery --output=text and --output=jsonproto by actionKey.
             # For more context on options and how this came to be, see https://github.com/hedronvision/bazel-compile-commands-extractor/pull/37
+    compile_args = action.arguments
+
     compile_only_flag = '/c' if '/c' in compile_args else '-c' # For Windows/msvc support
     source_index = compile_args.index(compile_only_flag) + 1
     source_file = compile_args[source_index]
     SOURCE_EXTENSIONS = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.m', '.mm', '.cu', '.cl', '.s', '.asm', '.S')
     assert source_file.endswith(SOURCE_EXTENSIONS), f"Source file not found after {compile_only_flag} in {compile_args}"
     assert source_index + 1 == len(compile_args) or compile_args[source_index + 1].startswith('-') or not compile_args[source_index + 1].endswith(SOURCE_EXTENSIONS), f"Multiple sources detected after {compile_only_flag}. Might work, but needs testing, and unlikely to be right given Bazel's incremental compilation. CMD: {compile_args}"
+
+    return source_file
+
+def _get_files(compile_action, compile_args: typing.List[str]):
+    """Gets the ({source files}, {header files}) clangd should be told the command applies to."""
+
+    source_file = compile_action.source_file
+
+    if {exclude_generated_sources}:
+        if _file_is_generated(source_file):
+            return set(), set()
 
     file_exists = os.path.isfile(source_file)
     if not file_exists:
@@ -387,6 +405,46 @@ def _all_platform_patch(compile_args: typing.List[str]):
 
     return list(compile_args)
 
+def _fix_compiler_path(compile_args: typing.List[str]):
+    """Rewrite the path to clang
+    Some toolchains will put a wrapper around clang - ex the grailbio llvm toolchain calls
+    a wrapper at external/<name-from-your-WORKSPACE>/bin/cc_wrapper.sh
+    This trips up clangd, which seems to expect to see a valid path to "clang" in compile_commands.json
+    Try to catch the known ones here
+    """
+
+    compiler = compile_args[0]
+    new_compiler = compiler
+
+    for regex, rewriter in _fix_compiler_path.known_wrappers:
+        # MIN_PY=3.8 if match := regex.match(compiler)
+        match = regex.match(compiler)
+        if match:
+            maybe_new_compiler = rewriter(match)
+
+            if {absolute_compiler_path}:
+                maybe_new_compiler = str(pathlib.PurePath(os.getcwd()).joinpath(maybe_new_compiler))
+
+            if os.path.isfile(maybe_new_compiler):
+                new_compiler = maybe_new_compiler
+                break
+
+
+    compile_args[0] = new_compiler
+    return compile_args
+
+
+# Trying to make this generic to rewrite different compile paths from different toolchains
+_fix_compiler_path.known_wrappers = (
+    # grailbio LLVM toolchain now uses: external/<name>/bin/cc_wrapper.sh
+    # <name> comes from workspace rule:
+    # llvm_toolchain(
+    #    name = "llvm_toolchain",
+    #    ...
+    # )
+    ( re.compile(r"external/([^/]+)/bin/cc_wrapper.sh"), lambda match: f"external/{match.group(1)}_llvm/bin/clang" ),
+)
+
 
 def _get_cpp_command_for_files(compile_action):
     """Reformat compile_action into a compile command clangd can understand.
@@ -398,7 +456,8 @@ def _get_cpp_command_for_files(compile_action):
     # Patch command by platform
     compile_args = _all_platform_patch(compile_args)
     compile_args = _apple_platform_patch(compile_args)
-    # Android and Linux and grailbio LLVM toolchains: Fine as is; no special patching needed.
+    compile_args = _fix_compiler_path(compile_args)
+    # Android and Linux toolchains: Fine as is; no special patching needed.
 
     source_files, header_files = _get_files(compile_action, compile_args)
 
@@ -417,7 +476,7 @@ def _convert_compile_commands(aquery_output):
 
     targets_by_id = {target.id : target.label for target in aquery_output.targets}
 
-    def _amend_action_as_external(action):
+    def _amend_action(action):
         """Tag action as external if it's generating an external target"""
         target = targets_by_id[action.targetId]
 
@@ -426,12 +485,17 @@ def _convert_compile_commands(aquery_output):
         assert not target.startswith("//external"), f"Not expecting target label to start with //external, for action {action.actionKey}"
 
         action.is_external = target.startswith("@")
+        action.source_file = _source_file_for_action(action)
+
         return action
 
-    actions = (_amend_action_as_external(action) for action in aquery_output.actions)
+    actions = (_amend_action(action) for action in aquery_output.actions)
 
     if {exclude_external_sources}:
         actions = filter(lambda action: not action.is_external, actions)
+
+    if {exclude_generated_sources}:
+        actions = filter(lambda action: not _file_is_generated(action.source_file), actions)
 
     # Process each action from Bazelisms -> file paths and their clang commands
     # Threads instead of processes because most of the execution time is farmed out to subprocesses. No need to sidestep the GIL. Might change after https://github.com/clangd/clangd/issues/123 resolved
