@@ -264,6 +264,9 @@ def _get_headers(compile_action, compile_args: typing.List[str], source_path: st
     if {exclude_headers} == "external":
         headers = {header for header in headers if _file_in_workspace_and_not_extenral(header)}
 
+    if {exclude_generated_sources}:
+        headers = {header for header in headers if not _file_is_generated(header)}
+
     return headers
 
 def _source_file_for_action(compile_action):
@@ -278,7 +281,7 @@ def _source_file_for_action(compile_action):
                 # Concretely, the message usually has the form "action 'Compiling foo.cpp'"" -> foo.cpp. But it also has "action 'Compiling src/tools/launcher/dummy.cc [for tool]'" -> external/bazel_tools/src/tools/launcher/dummy.cc
                 # If we did ever go this route, you can join the output from aquery --output=text and --output=jsonproto by actionKey.
             # For more context on options and how this came to be, see https://github.com/hedronvision/bazel-compile-commands-extractor/pull/37
-    compile_args = action.arguments
+    compile_args = compile_action.arguments
 
     compile_only_flag = '/c' if '/c' in compile_args else '-c' # For Windows/msvc support
     source_index = compile_args.index(compile_only_flag) + 1
