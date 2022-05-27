@@ -500,12 +500,21 @@ def _convert_compile_commands(aquery_output):
     if {exclude_generated_sources}:
         actions = filter(lambda action: not _file_is_generated(action.source_file), actions)
 
+
+    unique_actions = []
+    def unique(action):
+        return not any(other for other in unique_actions if action.source_file == other.source_file)
+
+    for action in actions:
+        if unique(action):
+            unique_actions.append(action)
+
     # Process each action from Bazelisms -> file paths and their clang commands
     # Threads instead of processes because most of the execution time is farmed out to subprocesses. No need to sidestep the GIL. Might change after https://github.com/clangd/clangd/issues/123 resolved
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(32, (os.cpu_count() or 1) + 4) # Backport. Default in MIN_PY=3.8. See "using very large resources implicitly on many-core machines" in https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
     ) as threadpool:
-        outputs = threadpool.map(_get_cpp_command_for_files, actions)
+        outputs = threadpool.map(_get_cpp_command_for_files, unique_actions)
 
     # Yield as compile_commands.json entries
     header_files_already_written = set()
@@ -569,7 +578,6 @@ def _get_commands(target: str, flags: str):
             continue
 
         print(line, file=sys.stderr)
-
 
     # Parse proto output from aquery
     try:
